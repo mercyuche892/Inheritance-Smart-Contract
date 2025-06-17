@@ -150,3 +150,204 @@
         false
     )
 )
+(define-constant ERR-NOT-OWNER (err u200))
+(define-constant ERR-RECOVERY-PERIOD-ACTIVE (err u201))
+(define-constant ERR-NO-RECOVERY-NEEDED (err u202))
+
+(define-data-var recovery-period uint u1008)
+
+(define-map recovery-requests
+    principal
+    {
+        requested-at: uint,
+        approved: bool,
+    }
+)
+
+(define-public (request-recovery)
+    (let ((estate (unwrap! (map-get? estates tx-sender) ERR-NOT-REGISTERED)))
+        (asserts! (not (get is-claimed estate)) ERR-ALREADY-CLAIMED)
+        (map-set recovery-requests tx-sender {
+            requested-at: stacks-block-height,
+            approved: false,
+        })
+        (ok true)
+    )
+)
+
+(define-public (execute-recovery)
+    (let (
+            (estate (unwrap! (map-get? estates tx-sender) ERR-NOT-REGISTERED))
+            (recovery (unwrap! (map-get? recovery-requests tx-sender)
+                ERR-NO-RECOVERY-NEEDED
+            ))
+        )
+        (asserts! (not (get is-claimed estate)) ERR-ALREADY-CLAIMED)
+        (asserts!
+            (>= stacks-block-height
+                (+ (get requested-at recovery) (var-get recovery-period))
+            )
+            ERR-RECOVERY-PERIOD-ACTIVE
+        )
+        (map-delete estates tx-sender)
+        (map-delete recovery-requests tx-sender)
+        (map-delete validation-signatures { estate-owner: tx-sender })
+        (stx-transfer? (get stx-amount estate) tx-sender tx-sender)
+    )
+)
+
+(define-read-only (get-recovery-status (address principal))
+    (map-get? recovery-requests address)
+)
+
+(define-read-only (can-execute-recovery (address principal))
+    (match (map-get? recovery-requests address)
+        recovery (>= stacks-block-height
+            (+ (get requested-at recovery) (var-get recovery-period))
+        )
+        false
+    )
+)
+(define-constant ERR-INVALID-PERCENTAGE (err u300))
+(define-constant ERR-PERCENTAGE-OVERFLOW (err u301))
+(define-constant ERR-MAX-BENEFICIARIES (err u302))
+(define-constant ERR-BENEFICIARY-EXISTS (err u303))
+
+(define-data-var max-beneficiaries uint u10)
+
+(define-map partial-estates
+    principal
+    {
+        total-amount: uint,
+        unlock-height: uint,
+        required-signs: uint,
+        is-active: bool,
+    }
+)
+
+(define-map beneficiaries
+    {
+        estate-owner: principal,
+        beneficiary: principal,
+    }
+    {
+        percentage: uint,
+        claimed: bool,
+        amount: uint,
+    }
+)
+
+(define-map estate-beneficiary-count
+    principal
+    uint
+)
+
+(define-public (create-partial-estate
+        (total-amount uint)
+        (lock-period uint)
+    )
+    (begin
+        (asserts! (> total-amount u0) ERR-ZERO-AMOUNT)
+        (asserts! (is-none (map-get? partial-estates tx-sender))
+            ERR-ALREADY-REGISTERED
+        )
+        (map-set partial-estates tx-sender {
+            total-amount: total-amount,
+            unlock-height: (+ stacks-block-height lock-period),
+            required-signs: (var-get minimum-signatures),
+            is-active: true,
+        })
+        (map-set estate-beneficiary-count tx-sender u0)
+        (ok true)
+    )
+)
+
+(define-public (add-beneficiary
+        (beneficiary principal)
+        (percentage uint)
+    )
+    (let (
+            (current-count (default-to u0 (map-get? estate-beneficiary-count tx-sender)))
+            (estate (unwrap! (map-get? partial-estates tx-sender) ERR-NOT-REGISTERED))
+        )
+        (asserts! (< current-count (var-get max-beneficiaries))
+            ERR-MAX-BENEFICIARIES
+        )
+        (asserts! (and (> percentage u0) (<= percentage u100))
+            ERR-INVALID-PERCENTAGE
+        )
+        (asserts!
+            (is-none (map-get? beneficiaries {
+                estate-owner: tx-sender,
+                beneficiary: beneficiary,
+            }))
+            ERR-BENEFICIARY-EXISTS
+        )
+        (let ((amount (/ (* (get total-amount estate) percentage) u100)))
+            (map-set beneficiaries {
+                estate-owner: tx-sender,
+                beneficiary: beneficiary,
+            } {
+                percentage: percentage,
+                claimed: false,
+                amount: amount,
+            })
+            (map-set estate-beneficiary-count tx-sender (+ current-count u1))
+            (ok true)
+        )
+    )
+)
+
+(define-public (claim-partial-inheritance (estate-owner principal))
+    (let (
+            (estate (unwrap! (map-get? partial-estates estate-owner) ERR-NOT-REGISTERED))
+            (beneficiary-data (unwrap!
+                (map-get? beneficiaries {
+                    estate-owner: estate-owner,
+                    beneficiary: tx-sender,
+                })
+                ERR-UNAUTHORIZED
+            ))
+            (signatures (default-to u0
+                (map-get? validation-signatures { estate-owner: estate-owner })
+            ))
+        )
+        (asserts! (get is-active estate) ERR-ALREADY-CLAIMED)
+        (asserts! (not (get claimed beneficiary-data)) ERR-ALREADY-CLAIMED)
+        (asserts! (>= stacks-block-height (get unlock-height estate))
+            ERR-INVALID-TIME-LOCK
+        )
+        (asserts! (>= signatures (get required-signs estate))
+            ERR-INSUFFICIENT-SIGNATURES
+        )
+        (map-set beneficiaries {
+            estate-owner: estate-owner,
+            beneficiary: tx-sender,
+        }
+            (merge beneficiary-data { claimed: true })
+        )
+        (match (stx-transfer? (get amount beneficiary-data) estate-owner tx-sender)
+            success (ok true)
+            error
+            ERR-TRANSFER-FAILED
+        )
+    )
+)
+
+(define-read-only (get-partial-estate-info (address principal))
+    (map-get? partial-estates address)
+)
+
+(define-read-only (get-beneficiary-info
+        (estate-owner principal)
+        (beneficiary principal)
+    )
+    (map-get? beneficiaries {
+        estate-owner: estate-owner,
+        beneficiary: beneficiary,
+    })
+)
+
+(define-read-only (get-beneficiary-count (estate-owner principal))
+    (default-to u0 (map-get? estate-beneficiary-count estate-owner))
+)
