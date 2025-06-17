@@ -1,8 +1,8 @@
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "@jest/globals";
+import { Simnet } from "@stacks/blockchain-api-client";
 
-const accounts = simnet.getAccounts();
-const address1 = accounts.get("wallet_1")!;
+const simnet = new Simnet();
 
 /*
   The test below is an example. To learn more, read the testing documentation here:
