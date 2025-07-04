@@ -9,9 +9,11 @@
 (define-constant ERR-ALREADY-CLAIMED (err u107))
 (define-constant ERR-ZERO-AMOUNT (err u108))
 (define-constant ERR-TRANSFER-FAILED (err u109))
+(define-constant ERR-CONTRACT-PAUSED (err u110))
 
 (define-data-var minimum-signatures uint u2)
 (define-data-var cooling-period uint u144)
+(define-data-var contract-active bool true)
 
 (define-map estates
     principal
@@ -47,6 +49,10 @@
         estate (>= stacks-block-height (get unlock-height estate))
         false
     )
+)
+
+(define-private (is-contract-active)
+    (var-get contract-active)
 )
 
 (define-public (register-estate
@@ -350,4 +356,101 @@
 
 (define-read-only (get-beneficiary-count (estate-owner principal))
     (default-to u0 (map-get? estate-beneficiary-count estate-owner))
+)
+
+(define-constant ERR-CANNOT-UPDATE-CLAIMED (err u500))
+(define-constant ERR-UPDATE-COOLDOWN-ACTIVE (err u501))
+(define-constant ERR-NO-CHANGES-DETECTED (err u502))
+
+(define-data-var update-cooldown uint u144)
+
+(define-map last-update-height
+    principal
+    uint
+)
+
+(define-private (can-update-estate (estate-owner principal))
+    (let ((last-update (default-to u0 (map-get? last-update-height estate-owner))))
+        (>= stacks-block-height (+ last-update (var-get update-cooldown)))
+    )
+)
+
+(define-public (update-estate-heir (new-heir principal))
+    (let ((estate (unwrap! (map-get? estates tx-sender) ERR-NOT-REGISTERED)))
+        (asserts! (is-contract-active) ERR-CONTRACT-PAUSED)
+        (asserts! (not (get is-claimed estate)) ERR-CANNOT-UPDATE-CLAIMED)
+        (asserts! (can-update-estate tx-sender) ERR-UPDATE-COOLDOWN-ACTIVE)
+        (asserts! (not (is-eq (get heir estate) new-heir))
+            ERR-NO-CHANGES-DETECTED
+        )
+        (map-set estates tx-sender (merge estate { heir: new-heir }))
+        (map-set last-update-height tx-sender stacks-block-height)
+        (ok true)
+    )
+)
+
+(define-public (update-estate-amount (new-amount uint))
+    (let ((estate (unwrap! (map-get? estates tx-sender) ERR-NOT-REGISTERED)))
+        (asserts! (is-contract-active) ERR-CONTRACT-PAUSED)
+        (asserts! (> new-amount u0) ERR-ZERO-AMOUNT)
+        (asserts! (not (get is-claimed estate)) ERR-CANNOT-UPDATE-CLAIMED)
+        (asserts! (can-update-estate tx-sender) ERR-UPDATE-COOLDOWN-ACTIVE)
+        (asserts! (not (is-eq (get stx-amount estate) new-amount))
+            ERR-NO-CHANGES-DETECTED
+        )
+        (map-set estates tx-sender (merge estate { stx-amount: new-amount }))
+        (map-set last-update-height tx-sender stacks-block-height)
+        (ok true)
+    )
+)
+
+(define-public (extend-estate-lock (additional-blocks uint))
+    (let ((estate (unwrap! (map-get? estates tx-sender) ERR-NOT-REGISTERED)))
+        (asserts! (is-contract-active) ERR-CONTRACT-PAUSED)
+        (asserts! (> additional-blocks u0) ERR-ZERO-AMOUNT)
+        (asserts! (not (get is-claimed estate)) ERR-CANNOT-UPDATE-CLAIMED)
+        (asserts! (can-update-estate tx-sender) ERR-UPDATE-COOLDOWN-ACTIVE)
+        (map-set estates tx-sender
+            (merge estate { unlock-height: (+ (get unlock-height estate) additional-blocks) })
+        )
+        (map-set last-update-height tx-sender stacks-block-height)
+        (ok true)
+    )
+)
+
+(define-public (update-required-signatures (new-signature-count uint))
+    (let ((estate (unwrap! (map-get? estates tx-sender) ERR-NOT-REGISTERED)))
+        (asserts! (is-contract-active) ERR-CONTRACT-PAUSED)
+        (asserts! (> new-signature-count u0) ERR-ZERO-AMOUNT)
+        (asserts! (not (get is-claimed estate)) ERR-CANNOT-UPDATE-CLAIMED)
+        (asserts! (can-update-estate tx-sender) ERR-UPDATE-COOLDOWN-ACTIVE)
+        (asserts! (not (is-eq (get required-signs estate) new-signature-count))
+            ERR-NO-CHANGES-DETECTED
+        )
+        (map-set estates tx-sender
+            (merge estate { required-signs: new-signature-count })
+        )
+        (map-set last-update-height tx-sender stacks-block-height)
+        (ok true)
+    )
+)
+
+(define-read-only (get-last-update-height (estate-owner principal))
+    (map-get? last-update-height estate-owner)
+)
+
+(define-read-only (can-update-now (estate-owner principal))
+    (can-update-estate estate-owner)
+)
+
+(define-read-only (blocks-until-next-update (estate-owner principal))
+    (let (
+            (last-update (default-to u0 (map-get? last-update-height estate-owner)))
+            (required-height (+ last-update (var-get update-cooldown)))
+        )
+        (if (>= stacks-block-height required-height)
+            u0
+            (- required-height stacks-block-height)
+        )
+    )
 )
