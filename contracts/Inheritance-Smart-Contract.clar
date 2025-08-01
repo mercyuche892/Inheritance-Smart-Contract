@@ -55,6 +55,23 @@
     (var-get contract-active)
 )
 
+(define-private (is-emergency-contact
+        (estate-owner principal)
+        (contact principal)
+    )
+    (match (map-get? emergency-contacts {
+        estate-owner: estate-owner,
+        contact: contact,
+    })
+        contact-data (get is-active contact-data)
+        false
+    )
+)
+
+(define-private (update-owner-activity (owner principal))
+    (map-set owner-activity owner stacks-block-height)
+)
+
 (define-public (register-estate
         (heir principal)
         (amount uint)
@@ -69,6 +86,7 @@
             required-signs: (var-get minimum-signatures),
             is-claimed: false,
         })
+        (update-owner-activity tx-sender)
         (ok true)
     )
 )
@@ -361,10 +379,45 @@
 (define-constant ERR-CANNOT-UPDATE-CLAIMED (err u500))
 (define-constant ERR-UPDATE-COOLDOWN-ACTIVE (err u501))
 (define-constant ERR-NO-CHANGES-DETECTED (err u502))
+(define-constant ERR-EMERGENCY-CONTACT-EXISTS (err u600))
+(define-constant ERR-NOT-EMERGENCY-CONTACT (err u601))
+(define-constant ERR-EMERGENCY-COOLDOWN-ACTIVE (err u602))
+(define-constant ERR-NO-EMERGENCY-DECLARED (err u603))
+(define-constant ERR-EMERGENCY-ALREADY-ACTIVE (err u604))
 
 (define-data-var update-cooldown uint u144)
+(define-data-var emergency-response-period uint u288)
+(define-data-var inactivity-threshold uint u2016)
 
 (define-map last-update-height
+    principal
+    uint
+)
+
+(define-map emergency-contacts
+    {
+        estate-owner: principal,
+        contact: principal,
+    }
+    {
+        relationship: (string-ascii 50),
+        added-at: uint,
+        is-active: bool,
+    }
+)
+
+(define-map emergency-alerts
+    principal
+    {
+        declared-at: uint,
+        declared-by: principal,
+        reason: (string-ascii 100),
+        is-active: bool,
+        response-deadline: uint,
+    }
+)
+
+(define-map owner-activity
     principal
     uint
 )
@@ -452,5 +505,139 @@
             u0
             (- required-height stacks-block-height)
         )
+    )
+)
+
+(define-public (add-emergency-contact
+        (contact principal)
+        (relationship (string-ascii 50))
+    )
+    (begin
+        (asserts! (is-some (map-get? estates tx-sender)) ERR-NOT-REGISTERED)
+        (asserts!
+            (is-none (map-get? emergency-contacts {
+                estate-owner: tx-sender,
+                contact: contact,
+            }))
+            ERR-EMERGENCY-CONTACT-EXISTS
+        )
+        (map-set emergency-contacts {
+            estate-owner: tx-sender,
+            contact: contact,
+        } {
+            relationship: relationship,
+            added-at: stacks-block-height,
+            is-active: true,
+        })
+        (update-owner-activity tx-sender)
+        (ok true)
+    )
+)
+
+(define-public (remove-emergency-contact (contact principal))
+    (begin
+        (asserts! (is-emergency-contact tx-sender contact)
+            ERR-NOT-EMERGENCY-CONTACT
+        )
+        (map-delete emergency-contacts {
+            estate-owner: tx-sender,
+            contact: contact,
+        })
+        (update-owner-activity tx-sender)
+        (ok true)
+    )
+)
+
+(define-public (declare-emergency
+        (estate-owner principal)
+        (reason (string-ascii 100))
+    )
+    (begin
+        (asserts! (is-emergency-contact estate-owner tx-sender)
+            ERR-NOT-EMERGENCY-CONTACT
+        )
+        (asserts! (is-some (map-get? estates estate-owner)) ERR-NOT-REGISTERED)
+        (asserts! (is-none (map-get? emergency-alerts estate-owner))
+            ERR-EMERGENCY-ALREADY-ACTIVE
+        )
+        (map-set emergency-alerts estate-owner {
+            declared-at: stacks-block-height,
+            declared-by: tx-sender,
+            reason: reason,
+            is-active: true,
+            response-deadline: (+ stacks-block-height (var-get emergency-response-period)),
+        })
+        (ok true)
+    )
+)
+
+(define-public (respond-to-emergency)
+    (let ((alert (unwrap! (map-get? emergency-alerts tx-sender) ERR-NO-EMERGENCY-DECLARED)))
+        (asserts! (get is-active alert) ERR-NO-EMERGENCY-DECLARED)
+        (asserts! (< stacks-block-height (get response-deadline alert))
+            ERR-EMERGENCY-COOLDOWN-ACTIVE
+        )
+        (map-delete emergency-alerts tx-sender)
+        (update-owner-activity tx-sender)
+        (ok true)
+    )
+)
+
+(define-public (execute-emergency-inheritance (estate-owner principal))
+    (let (
+            (estate (unwrap! (map-get? estates estate-owner) ERR-NOT-REGISTERED))
+            (alert (unwrap! (map-get? emergency-alerts estate-owner)
+                ERR-NO-EMERGENCY-DECLARED
+            ))
+        )
+        (asserts! (is-emergency-contact estate-owner tx-sender)
+            ERR-NOT-EMERGENCY-CONTACT
+        )
+        (asserts! (get is-active alert) ERR-NO-EMERGENCY-DECLARED)
+        (asserts! (>= stacks-block-height (get response-deadline alert))
+            ERR-EMERGENCY-COOLDOWN-ACTIVE
+        )
+        (asserts! (not (get is-claimed estate)) ERR-ALREADY-CLAIMED)
+        (map-set estates estate-owner (merge estate { is-claimed: true }))
+        (map-delete emergency-alerts estate-owner)
+        (match (stx-transfer? (get stx-amount estate) estate-owner (get heir estate))
+            success (ok true)
+            error
+            ERR-TRANSFER-FAILED
+        )
+    )
+)
+
+(define-read-only (get-emergency-contact-info
+        (estate-owner principal)
+        (contact principal)
+    )
+    (map-get? emergency-contacts {
+        estate-owner: estate-owner,
+        contact: contact,
+    })
+)
+
+(define-read-only (get-emergency-alert-info (estate-owner principal))
+    (map-get? emergency-alerts estate-owner)
+)
+
+(define-read-only (get-owner-activity (owner principal))
+    (map-get? owner-activity owner)
+)
+
+(define-read-only (is-owner-inactive (owner principal))
+    (let ((last-activity (default-to u0 (map-get? owner-activity owner))))
+        (>= (- stacks-block-height last-activity) (var-get inactivity-threshold))
+    )
+)
+
+(define-read-only (can-execute-emergency (estate-owner principal))
+    (match (map-get? emergency-alerts estate-owner)
+        alert (and
+            (get is-active alert)
+            (>= stacks-block-height (get response-deadline alert))
+        )
+        false
     )
 )
