@@ -384,10 +384,16 @@
 (define-constant ERR-EMERGENCY-COOLDOWN-ACTIVE (err u602))
 (define-constant ERR-NO-EMERGENCY-DECLARED (err u603))
 (define-constant ERR-EMERGENCY-ALREADY-ACTIVE (err u604))
+(define-constant ERR-DELEGATION-EXISTS (err u700))
+(define-constant ERR-NOT-DELEGATED (err u701))
+(define-constant ERR-INVALID-DELEGATION-PERIOD (err u702))
+(define-constant ERR-DELEGATION-EXPIRED (err u703))
+(define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u704))
 
 (define-data-var update-cooldown uint u144)
 (define-data-var emergency-response-period uint u288)
 (define-data-var inactivity-threshold uint u2016)
+(define-data-var max-delegation-period uint u4032)
 
 (define-map last-update-height
     principal
@@ -422,9 +428,125 @@
     uint
 )
 
+(define-map estate-delegations
+    {
+        estate-owner: principal,
+        delegate: principal,
+    }
+    {
+        granted-at: uint,
+        expires-at: uint,
+        permissions: uint,
+        is-active: bool,
+    }
+)
+
 (define-private (can-update-estate (estate-owner principal))
     (let ((last-update (default-to u0 (map-get? last-update-height estate-owner))))
         (>= stacks-block-height (+ last-update (var-get update-cooldown)))
+    )
+)
+
+(define-private (is-delegate
+        (estate-owner principal)
+        (delegate principal)
+    )
+    (match (map-get? estate-delegations {
+        estate-owner: estate-owner,
+        delegate: delegate,
+    })
+        delegation (and
+            (get is-active delegation)
+            (>= (get expires-at delegation) stacks-block-height)
+        )
+        false
+    )
+)
+
+(define-private (has-delegation-permission
+        (estate-owner principal)
+        (permission uint)
+    )
+    (or
+        (is-eq tx-sender estate-owner)
+        (match (map-get? estate-delegations {
+            estate-owner: estate-owner,
+            delegate: tx-sender,
+        })
+            delegation (and
+                (get is-active delegation)
+                (>= (get expires-at delegation) stacks-block-height)
+                (> (bit-and (get permissions delegation) permission) u0)
+            )
+            false
+        )
+    )
+)
+
+(define-public (delegate-estate-management
+        (delegate principal)
+        (permissions uint)
+        (duration-blocks uint)
+    )
+    (begin
+        (asserts! (is-some (map-get? estates tx-sender)) ERR-NOT-REGISTERED)
+        (asserts! (not (is-eq tx-sender delegate)) ERR-CANNOT-DELEGATE-TO-SELF)
+        (asserts!
+            (and (> duration-blocks u0) (<= duration-blocks (var-get max-delegation-period)))
+            ERR-INVALID-DELEGATION-PERIOD
+        )
+        (asserts!
+            (is-none (map-get? estate-delegations {
+                estate-owner: tx-sender,
+                delegate: delegate,
+            }))
+            ERR-DELEGATION-EXISTS
+        )
+        (map-set estate-delegations {
+            estate-owner: tx-sender,
+            delegate: delegate,
+        } {
+            granted-at: stacks-block-height,
+            expires-at: (+ stacks-block-height duration-blocks),
+            permissions: permissions,
+            is-active: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (revoke-delegation (delegate principal))
+    (begin
+        (asserts!
+            (is-some (map-get? estate-delegations {
+                estate-owner: tx-sender,
+                delegate: delegate,
+            }))
+            ERR-NOT-DELEGATED
+        )
+        (map-delete estate-delegations {
+            estate-owner: tx-sender,
+            delegate: delegate,
+        })
+        (ok true)
+    )
+)
+
+(define-public (delegate-update-heir
+        (estate-owner principal)
+        (new-heir principal)
+    )
+    (let ((estate (unwrap! (map-get? estates estate-owner) ERR-NOT-REGISTERED)))
+        (asserts! (is-contract-active) ERR-CONTRACT-PAUSED)
+        (asserts! (not (get is-claimed estate)) ERR-CANNOT-UPDATE-CLAIMED)
+        (asserts! (can-update-estate estate-owner) ERR-UPDATE-COOLDOWN-ACTIVE)
+        (asserts! (has-delegation-permission estate-owner u1) ERR-UNAUTHORIZED)
+        (asserts! (not (is-eq (get heir estate) new-heir))
+            ERR-NO-CHANGES-DETECTED
+        )
+        (map-set estates estate-owner (merge estate { heir: new-heir }))
+        (map-set last-update-height estate-owner stacks-block-height)
+        (ok true)
     )
 )
 
@@ -639,5 +761,35 @@
             (>= stacks-block-height (get response-deadline alert))
         )
         false
+    )
+)
+
+(define-read-only (get-delegation-info
+        (estate-owner principal)
+        (delegate principal)
+    )
+    (map-get? estate-delegations {
+        estate-owner: estate-owner,
+        delegate: delegate,
+    })
+)
+
+(define-read-only (is-delegation-active
+        (estate-owner principal)
+        (delegate principal)
+    )
+    (is-delegate estate-owner delegate)
+)
+
+(define-read-only (get-delegation-expiry
+        (estate-owner principal)
+        (delegate principal)
+    )
+    (match (map-get? estate-delegations {
+        estate-owner: estate-owner,
+        delegate: delegate,
+    })
+        delegation (some (get expires-at delegation))
+        none
     )
 )
