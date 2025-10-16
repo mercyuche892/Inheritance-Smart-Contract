@@ -793,3 +793,267 @@
         none
     )
 )
+
+;; =============================================================================
+;; ESTATE AUDIT TRAIL FEATURE
+;; =============================================================================
+
+;; Error constants for audit trail
+(define-constant ERR-AUDIT-LIMIT-EXCEEDED (err u800))
+(define-constant ERR-INVALID-ACTION-TYPE (err u801))
+(define-constant ERR-AUDIT-DISABLED (err u802))
+
+;; Data variables for audit configuration
+(define-data-var audit-enabled bool true)
+(define-data-var max-audit-entries uint u100)
+(define-data-var audit-retention-blocks uint u52560) ;; ~1 year at 10min blocks
+
+;; Action type constants for audit trail
+(define-constant ACTION-ESTATE-REGISTERED u1)
+(define-constant ACTION-ESTATE-CLAIMED u2)
+(define-constant ACTION-HEIR-UPDATED u3)
+(define-constant ACTION-AMOUNT-UPDATED u4)
+(define-constant ACTION-VALIDATOR-ADDED u5)
+(define-constant ACTION-EMERGENCY-DECLARED u6)
+(define-constant ACTION-RECOVERY-REQUESTED u7)
+(define-constant ACTION-DELEGATION-GRANTED u8)
+
+;; Audit trail entry structure
+(define-map audit-trail
+    {
+        estate-owner: principal,
+        entry-id: uint
+    }
+    {
+        action-type: uint,
+        actor: principal,
+        block-height: uint,
+        details: (string-ascii 200),
+        stx-amount: (optional uint),
+        related-principal: (optional principal)
+    }
+)
+
+;; Track entry count per estate
+(define-map audit-entry-count
+    principal
+    uint
+)
+
+;; Track global audit statistics
+(define-map audit-stats
+    uint ;; action-type
+    uint ;; count
+)
+
+;; Private function to log audit entry
+(define-private (log-audit-entry
+        (estate-owner principal)
+        (action-type uint)
+        (details (string-ascii 200))
+        (stx-amount (optional uint))
+        (related-principal (optional principal))
+    )
+    (if (var-get audit-enabled)
+        (let (
+                (current-count (default-to u0 (map-get? audit-entry-count estate-owner)))
+                (next-entry-id (+ current-count u1))
+            )
+            (if (< current-count (var-get max-audit-entries))
+                (begin
+                    ;; Add audit entry
+                    (map-set audit-trail {
+                        estate-owner: estate-owner,
+                        entry-id: next-entry-id
+                    } {
+                        action-type: action-type,
+                        actor: tx-sender,
+                        block-height: stacks-block-height,
+                        details: details,
+                        stx-amount: stx-amount,
+                        related-principal: related-principal
+                    })
+                    ;; Update entry count
+                    (map-set audit-entry-count estate-owner next-entry-id)
+                    ;; Update global stats
+                    (map-set audit-stats action-type
+                        (+ (default-to u0 (map-get? audit-stats action-type)) u1)
+                    )
+                    (ok true)
+                )
+                ERR-AUDIT-LIMIT-EXCEEDED
+            )
+        )
+        ERR-AUDIT-DISABLED
+    )
+)
+
+;; Enhanced estate registration with audit logging
+(define-public (register-estate-with-audit
+        (heir principal)
+        (amount uint)
+        (memo (string-ascii 200))
+    )
+    (begin
+        (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+        (asserts! (is-none (map-get? estates tx-sender)) ERR-ALREADY-REGISTERED)
+        (map-set estates tx-sender {
+            heir: heir,
+            stx-amount: amount,
+            unlock-height: (+ stacks-block-height (var-get cooling-period)),
+            required-signs: (var-get minimum-signatures),
+            is-claimed: false,
+        })
+        (update-owner-activity tx-sender)
+        ;; Log audit entry
+        (try! (log-audit-entry
+            tx-sender
+            ACTION-ESTATE-REGISTERED
+            memo
+            (some amount)
+            (some heir)
+        ))
+        (ok true)
+    )
+)
+
+;; Enhanced claim estate with audit logging
+(define-public (claim-estate-with-audit
+        (estate-owner principal)
+        (memo (string-ascii 200))
+    )
+    (let (
+            (estate (unwrap! (map-get? estates estate-owner) ERR-NOT-REGISTERED))
+            (signatures (default-to u0
+                (map-get? validation-signatures { estate-owner: estate-owner })
+            ))
+        )
+        (asserts! (is-eq tx-sender (get heir estate)) ERR-UNAUTHORIZED)
+        (asserts! (not (get is-claimed estate)) ERR-ALREADY-CLAIMED)
+        (asserts! (check-time-lock estate-owner) ERR-INVALID-TIME-LOCK)
+        (asserts! (>= signatures (get required-signs estate))
+            ERR-INSUFFICIENT-SIGNATURES
+        )
+        (map-set estates estate-owner (merge estate { is-claimed: true }))
+        ;; Log audit entry before transfer
+        (try! (log-audit-entry
+            estate-owner
+            ACTION-ESTATE-CLAIMED
+            memo
+            (some (get stx-amount estate))
+            (some (get heir estate))
+        ))
+        (match (stx-transfer? (get stx-amount estate) estate-owner (get heir estate))
+            success (ok true)
+            error
+            ERR-TRANSFER-FAILED
+        )
+    )
+)
+
+;; Public function to enable/disable audit trail (owner only)
+(define-public (set-audit-status (enabled bool))
+    (begin
+        (asserts! (is-owner) ERR-OWNER-ONLY)
+        (var-set audit-enabled enabled)
+        (ok true)
+    )
+)
+
+;; Public function to update audit configuration (owner only)
+(define-public (update-audit-config
+        (max-entries uint)
+        (retention-blocks uint)
+    )
+    (begin
+        (asserts! (is-owner) ERR-OWNER-ONLY)
+        (asserts! (> max-entries u0) ERR-ZERO-AMOUNT)
+        (asserts! (> retention-blocks u0) ERR-ZERO-AMOUNT)
+        (var-set max-audit-entries max-entries)
+        (var-set audit-retention-blocks retention-blocks)
+        (ok true)
+    )
+)
+
+;; Public function to clean a specific audit entry (simplified)
+(define-public (cleanup-audit-entry (estate-owner principal) (entry-id uint))
+    (let (
+            (retention-threshold (- stacks-block-height (var-get audit-retention-blocks)))
+        )
+        (match (map-get? audit-trail { estate-owner: estate-owner, entry-id: entry-id })
+            entry
+            (if (< (get block-height entry) retention-threshold)
+                (begin
+                    (map-delete audit-trail { estate-owner: estate-owner, entry-id: entry-id })
+                    (ok true)
+                )
+                (ok false) ;; Entry is not old enough
+            )
+            (ok false) ;; Entry does not exist
+        )
+    )
+)
+
+;; Read-only functions for audit trail
+(define-read-only (get-audit-entry
+        (estate-owner principal)
+        (entry-id uint)
+    )
+    (map-get? audit-trail {
+        estate-owner: estate-owner,
+        entry-id: entry-id
+    })
+)
+
+(define-read-only (get-estate-audit-count (estate-owner principal))
+    (default-to u0 (map-get? audit-entry-count estate-owner))
+)
+
+(define-read-only (get-audit-stats-for-action (action-type uint))
+    (default-to u0 (map-get? audit-stats action-type))
+)
+
+(define-read-only (is-audit-enabled)
+    (var-get audit-enabled)
+)
+
+(define-read-only (get-audit-config)
+    (ok {
+        enabled: (var-get audit-enabled),
+        max-entries: (var-get max-audit-entries),
+        retention-blocks: (var-get audit-retention-blocks)
+    })
+)
+
+;; Get basic audit trail summary for an estate
+(define-read-only (get-audit-trail-summary (estate-owner principal))
+    (let (
+            (total-entries (get-estate-audit-count estate-owner))
+            (max-entry-id total-entries)
+        )
+        (ok {
+            total-entries: total-entries,
+            has-entries: (> total-entries u0),
+            last-entry-id: max-entry-id,
+            last-activity: (if (> max-entry-id u0)
+                (match (map-get? audit-trail { estate-owner: estate-owner, entry-id: max-entry-id })
+                    entry (some (get block-height entry))
+                    none
+                )
+                none
+            )
+        })
+    )
+)
+
+;; Check if a specific audit entry matches an action type
+(define-read-only (check-audit-entry-type
+        (estate-owner principal)
+        (entry-id uint)
+        (action-type uint)
+    )
+    (match (map-get? audit-trail { estate-owner: estate-owner, entry-id: entry-id })
+        entry (is-eq (get action-type entry) action-type)
+        false
+    )
+)
