@@ -822,7 +822,7 @@
 (define-map audit-trail
     {
         estate-owner: principal,
-        entry-id: uint
+        entry-id: uint,
     }
     {
         action-type: uint,
@@ -830,7 +830,7 @@
         block-height: uint,
         details: (string-ascii 200),
         stx-amount: (optional uint),
-        related-principal: (optional principal)
+        related-principal: (optional principal),
     }
 )
 
@@ -864,14 +864,14 @@
                     ;; Add audit entry
                     (map-set audit-trail {
                         estate-owner: estate-owner,
-                        entry-id: next-entry-id
+                        entry-id: next-entry-id,
                     } {
                         action-type: action-type,
                         actor: tx-sender,
                         block-height: stacks-block-height,
                         details: details,
                         stx-amount: stx-amount,
-                        related-principal: related-principal
+                        related-principal: related-principal,
                     })
                     ;; Update entry count
                     (map-set audit-entry-count estate-owner next-entry-id)
@@ -906,11 +906,7 @@
         })
         (update-owner-activity tx-sender)
         ;; Log audit entry
-        (try! (log-audit-entry
-            tx-sender
-            ACTION-ESTATE-REGISTERED
-            memo
-            (some amount)
+        (try! (log-audit-entry tx-sender ACTION-ESTATE-REGISTERED memo (some amount)
             (some heir)
         ))
         (ok true)
@@ -936,12 +932,8 @@
         )
         (map-set estates estate-owner (merge estate { is-claimed: true }))
         ;; Log audit entry before transfer
-        (try! (log-audit-entry
-            estate-owner
-            ACTION-ESTATE-CLAIMED
-            memo
-            (some (get stx-amount estate))
-            (some (get heir estate))
+        (try! (log-audit-entry estate-owner ACTION-ESTATE-CLAIMED memo
+            (some (get stx-amount estate)) (some (get heir estate))
         ))
         (match (stx-transfer? (get stx-amount estate) estate-owner (get heir estate))
             success (ok true)
@@ -976,15 +968,22 @@
 )
 
 ;; Public function to clean a specific audit entry (simplified)
-(define-public (cleanup-audit-entry (estate-owner principal) (entry-id uint))
-    (let (
-            (retention-threshold (- stacks-block-height (var-get audit-retention-blocks)))
-        )
-        (match (map-get? audit-trail { estate-owner: estate-owner, entry-id: entry-id })
+(define-public (cleanup-audit-entry
+        (estate-owner principal)
+        (entry-id uint)
+    )
+    (let ((retention-threshold (- stacks-block-height (var-get audit-retention-blocks))))
+        (match (map-get? audit-trail {
+            estate-owner: estate-owner,
+            entry-id: entry-id,
+        })
             entry
             (if (< (get block-height entry) retention-threshold)
                 (begin
-                    (map-delete audit-trail { estate-owner: estate-owner, entry-id: entry-id })
+                    (map-delete audit-trail {
+                        estate-owner: estate-owner,
+                        entry-id: entry-id,
+                    })
                     (ok true)
                 )
                 (ok false) ;; Entry is not old enough
@@ -1001,7 +1000,7 @@
     )
     (map-get? audit-trail {
         estate-owner: estate-owner,
-        entry-id: entry-id
+        entry-id: entry-id,
     })
 )
 
@@ -1021,7 +1020,7 @@
     (ok {
         enabled: (var-get audit-enabled),
         max-entries: (var-get max-audit-entries),
-        retention-blocks: (var-get audit-retention-blocks)
+        retention-blocks: (var-get audit-retention-blocks),
     })
 )
 
@@ -1036,12 +1035,15 @@
             has-entries: (> total-entries u0),
             last-entry-id: max-entry-id,
             last-activity: (if (> max-entry-id u0)
-                (match (map-get? audit-trail { estate-owner: estate-owner, entry-id: max-entry-id })
+                (match (map-get? audit-trail {
+                    estate-owner: estate-owner,
+                    entry-id: max-entry-id,
+                })
                     entry (some (get block-height entry))
                     none
                 )
                 none
-            )
+            ),
         })
     )
 )
@@ -1052,8 +1054,129 @@
         (entry-id uint)
         (action-type uint)
     )
-    (match (map-get? audit-trail { estate-owner: estate-owner, entry-id: entry-id })
+    (match (map-get? audit-trail {
+        estate-owner: estate-owner,
+        entry-id: entry-id,
+    })
         entry (is-eq (get action-type entry) action-type)
+        false
+    )
+)
+
+(define-constant ERR-ESCROW-EXISTS (err u900))
+(define-constant ERR-ESCROW-NOT-FOUND (err u901))
+(define-constant ERR-ESCROW-ALREADY-CLAIMED (err u902))
+(define-constant ERR-ESCROW-TRANSFER-FAILED (err u903))
+(define-constant ERR-ESCROW-INVALID-LOCK (err u904))
+(define-constant ERR-ESCROW-UNAUTHORIZED (err u905))
+
+(define-map escrow-estates
+    principal
+    {
+        heir: principal,
+        amount: uint,
+        unlock-height: uint,
+        required-signs: uint,
+        is-claimed: bool,
+    }
+)
+
+(define-map escrow-signatures
+    { estate-owner: principal }
+    uint
+)
+
+(define-public (create-escrow-estate
+        (heir principal)
+        (lock-period uint)
+        (amount uint)
+    )
+    (begin
+        (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+        (asserts! (> lock-period u0) ERR-ESCROW-INVALID-LOCK)
+        (asserts! (is-none (map-get? escrow-estates tx-sender)) ERR-ESCROW-EXISTS)
+        (match (stx-transfer? amount tx-sender (as-contract tx-sender))
+            success (begin
+                (map-set escrow-estates tx-sender {
+                    heir: heir,
+                    amount: amount,
+                    unlock-height: (+ stacks-block-height lock-period),
+                    required-signs: (var-get minimum-signatures),
+                    is-claimed: false,
+                })
+                (ok true)
+            )
+            error
+            ERR-ESCROW-TRANSFER-FAILED
+        )
+    )
+)
+
+(define-public (validate-escrow-estate (estate-owner principal))
+    (begin
+        (asserts! (is-validator) ERR-UNAUTHORIZED)
+        (asserts! (is-some (map-get? escrow-estates estate-owner))
+            ERR-ESCROW-NOT-FOUND
+        )
+        (map-set escrow-signatures { estate-owner: estate-owner }
+            (+
+                (default-to u0
+                    (map-get? escrow-signatures { estate-owner: estate-owner })
+                )
+                u1
+            ))
+        (ok true)
+    )
+)
+
+(define-public (claim-escrow-estate (estate-owner principal))
+    (let (
+            (estate (unwrap! (map-get? escrow-estates estate-owner) ERR-ESCROW-NOT-FOUND))
+            (sigs (default-to u0
+                (map-get? escrow-signatures { estate-owner: estate-owner })
+            ))
+        )
+        (asserts! (is-eq tx-sender (get heir estate)) ERR-ESCROW-UNAUTHORIZED)
+        (asserts! (not (get is-claimed estate)) ERR-ESCROW-ALREADY-CLAIMED)
+        (asserts! (>= stacks-block-height (get unlock-height estate))
+            ERR-ESCROW-INVALID-LOCK
+        )
+        (asserts! (>= sigs (get required-signs estate))
+            ERR-INSUFFICIENT-SIGNATURES
+        )
+        (map-set escrow-estates estate-owner (merge estate { is-claimed: true }))
+        (as-contract (stx-transfer? (get amount estate) tx-sender (get heir estate)))
+    )
+)
+
+(define-public (refund-escrow-estate)
+    (let ((estate (unwrap! (map-get? escrow-estates tx-sender) ERR-ESCROW-NOT-FOUND)))
+        (asserts! (not (get is-claimed estate)) ERR-ESCROW-ALREADY-CLAIMED)
+        (map-delete escrow-estates tx-sender)
+        (as-contract (stx-transfer? (get amount estate) tx-sender tx-sender))
+    )
+)
+
+(define-read-only (get-escrow-estate (owner principal))
+    (map-get? escrow-estates owner)
+)
+
+(define-read-only (get-escrow-signature-count (owner principal))
+    (ok (default-to u0 (map-get? escrow-signatures { estate-owner: owner })))
+)
+
+(define-read-only (can-claim-escrow (owner principal))
+    (match (map-get? escrow-estates owner)
+        estate (and
+            (>= stacks-block-height (get unlock-height estate))
+            (>=
+                (default-to u0
+                    (map-get? escrow-signatures { estate-owner: owner })
+                )
+                (get required-signs estate)
+            )
+            (not (get is-claimed estate))
+        )
         false
     )
 )
